@@ -18,8 +18,10 @@ var fso = new ActiveXObject("Scripting.FileSystemObject");
 // Wine's JScript has no GetObject("winmgmts:"), so connect to WMI through the locator.
 var wmi = new ActiveXObject("WbemScripting.SWbemLocator").ConnectServer(".", "root\\cimv2");
 
+// An environment variable's value, or "" if it isn't set. Wine's ExpandEnvironmentStrings leaves
+// the terminating NUL character on its result, so strip that before comparing.
 function env(name) {
-  var v = sh.ExpandEnvironmentStrings("%" + name + "%");
+  var v = String(sh.ExpandEnvironmentStrings("%" + name + "%")).replace(/\0+$/, "");
   return v === "%" + name + "%" ? "" : v;
 }
 
