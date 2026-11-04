@@ -20,6 +20,7 @@ modify the game or Recursion Tracker.
 ## Contents
 
 - [Requirements](#requirements)
+- [Which desktops work](#which-desktops-work)
 - [1. Install Recursion Tracker into PlanetSide 2's prefix](#1-install-recursion-tracker-into-planetside-2s-prefix)
 - [2. Install ps2-with-recursion](#2-install-ps2-with-recursion)
 - [3. Set the Steam launch option](#3-set-the-steam-launch-option)
@@ -38,21 +39,42 @@ modify the game or Recursion Tracker.
 | PlanetSide 2 from Steam, running under Proton | Any Proton works: Valve's Proton, Proton Experimental, GE-Proton, Proton-CachyOS, … |
 | Steam from your distribution, not Flatpak | Flatpak Steam runs launch options inside its sandbox, where this tool can't reach your desktop. |
 | Recursion Tracker installed **in PlanetSide 2's Proton prefix** | See step 1. |
-| `xdotool`, `xwininfo`, and `busctl` or `gdbus` | SteamOS already has all of them. See the table below for other distributions. |
-| For the clean quit: a desktop that shows Wine tray icons through `xembedsniproxy` | KDE Plasma does this, including SteamOS Desktop Mode. Everywhere else, Recursion Tracker is force-closed 20 s after the game instead (see [Limitations](#limitations)). |
+| `xdotool`, `xwininfo`, `xprop`, and `busctl` or `gdbus` | SteamOS already has all of them. See the table below for other distributions. |
+| For the clean quit: a system tray that shows Wine's tray icons | KDE Plasma (including SteamOS Desktop Mode), or a classic system tray such as Xfce's or MATE's. Without one, Recursion Tracker is force-closed 20 s after the game instead. See [Which desktops work](#which-desktops-work). |
 
 Installing the tools on other distributions:
 
 | Distribution | Command |
 |---|---|
 | SteamOS | Nothing to install. |
-| Arch, Manjaro, CachyOS, EndeavourOS | `sudo pacman -S --needed xdotool xorg-xwininfo` |
+| Arch, Manjaro, CachyOS, EndeavourOS | `sudo pacman -S --needed xdotool xorg-xwininfo xorg-xprop` |
 | Debian, Ubuntu, Linux Mint, Pop!_OS | `sudo apt install xdotool x11-utils` |
-| Fedora | `sudo dnf install xdotool xwininfo` |
-| Bazzite and other Fedora Atomic | `rpm-ostree install xdotool xwininfo`, then reboot |
-| openSUSE | `sudo zypper install xdotool xwininfo` |
+| Fedora | `sudo dnf install xdotool xwininfo xprop` |
+| Bazzite and other Fedora Atomic | `rpm-ostree install xdotool xwininfo xprop`, then reboot |
+| openSUSE | `sudo zypper install xdotool xwininfo xprop` |
 
 `busctl` comes with systemd and `gdbus` with glib2, so you almost certainly have one of them.
+Only KDE Plasma needs them, and only classic trays need `xprop`.
+
+## Which desktops work
+
+Starting Recursion Tracker with the game and hiding its console windows work on any desktop.
+The clean quit (clicking **Exit** in its tray menu) needs a system tray that shows Wine's icons:
+
+| Desktop | Clean quit | How the tray icon is found |
+|---|---|---|
+| KDE Plasma, including SteamOS Desktop Mode | Yes, tested on SteamOS | KDE's `xembedsniproxy` shows Wine's icon in Plasma's tray. The tool finds it over D-Bus. |
+| Xfce | Yes, tested with Xfce 4.20's panel | Wine docks its icon in the panel's tray (XEmbed). The tool finds that small window and right-clicks it. |
+| MATE, LXDE, LXQt, Budgie, and window managers with an XEmbed tray (stalonetray, trayer, …), on X11 | Expected to work, untested (stalonetray was tested) | Same as Xfce. |
+| Cinnamon | Untested | Cinnamon draws tray icons itself. If Wine's icon window isn't really under the pointer where it appears, the tool doesn't click (see below), and Recursion Tracker is force-closed. |
+| GNOME | No | GNOME has no system tray, so Recursion Tracker is force-closed. |
+| Steam's Game Mode | No | No tray, so Recursion Tracker is force-closed. |
+
+On a classic tray, the tool first moves the pointer onto the icon and checks that the window
+under the pointer really is Recursion Tracker's icon or the tray holding it. If something else
+is there, it doesn't click.
+
+Run `ps2-with-recursion --test` (game closed) to find out what your desktop does.
 
 ## 1. Install Recursion Tracker into PlanetSide 2's prefix
 
@@ -157,7 +179,9 @@ Browse local files), the Windows side, rewritten at every launch.
 | Recursion Tracker doesn't start, and the journal says *not installed in …/pfx* | It isn't in PlanetSide 2's prefix. See step 1. The game still starts normally. |
 | The journal has no `ps2-with-recursion` lines at all | Check the launch option, and that `~/.local/bin/ps2-with-recursion` exists and is executable. |
 | *Recursion Tracker still running after 20 s, forcing it* (game folder log) | The clean quit didn't work. The journal says why. Run `ps2-with-recursion --test` with the game closed. |
-| *no tray icon for Recursion Tracker found* | Your desktop doesn't show Wine tray icons through `xembedsniproxy`, or you are in Game Mode. Recursion Tracker is force-closed instead. |
+| *no tray icon for Recursion Tracker found* | Your desktop has no system tray that shows Wine's icons (GNOME, Game Mode), or `xprop` is missing on a classic tray. Recursion Tracker is force-closed instead. See [Which desktops work](#which-desktops-work). |
+| *the pointer at Recursion Tracker's tray icon … is over another window, so not clicking* | A window covered the tray, or your desktop draws tray icons somewhere other than Wine's own icon window. Recursion Tracker is force-closed instead. |
+| `--test` fails on stalonetray right after an earlier run | stalonetray sometimes ignores Wine's icon after an earlier one went away. Restart stalonetray and run the test again. |
 | *xdotool, xwininfo or DISPLAY missing* | Install the tools ([Requirements](#requirements)). |
 | Black console windows still show up | On desktops other than KDE they can show for up to a second before they are hidden. If they stay, check the journal. |
 | Steam still shows PlanetSide 2 as running | Something in the prefix is still open. Check the game folder log. |
@@ -193,7 +217,8 @@ Steam ─► ps2-with-recursion (Linux, your launch option)
                                          │
 watcher (Linux) ◄────────────────────────┘
    every second: hides Recursion Tracker's console windows (xdotool windowunmap)
-   on .quit: finds Recursion Tracker's tray icon over D-Bus (StatusNotifierItem),
+   on .quit: finds Recursion Tracker's tray icon, either over D-Bus (KDE Plasma's
+             StatusNotifierItem) or as Wine's icon window in a classic XEmbed tray,
              right-clicks it, clicks Exit (the menu's last item), puts the pointer back
    the .js force-closes Recursion Tracker if it is still running 20 s later
 ```
@@ -238,11 +263,11 @@ ps2-with-recursion --help
 
 - **Your mouse pointer moves for a moment** when the game closes. Clicking the tray menu is the
   only way found to trigger Recursion Tracker's real Exit.
-- **The clean quit needs `xembedsniproxy`.** KDE Plasma runs it, as do some setups with other
-  desktops. Elsewhere (GNOME, Xfce, …) Recursion Tracker is force-closed 20 s after the game.
-  It then doesn't save changes you made during that session to its event filters or tracked
-  players. In testing, its options were saved as soon as its options window closed, so those
-  were kept.
+- **The clean quit needs a system tray that shows Wine's icons** (see
+  [Which desktops work](#which-desktops-work)). Without one, Recursion Tracker is force-closed
+  20 s after the game. It then doesn't save changes you made during that session to its event
+  filters or tracked players. In testing, its options were saved as soon as its options window
+  closed, so those were kept.
 - **Steam's Game Mode** has no tray, so Recursion Tracker is force-closed there. Starting it and
   hiding the console windows are expected to work, but haven't been tested in Game Mode.
 - **Exit must stay the last item** of Recursion Tracker's tray menu. If a Recursion Tracker update
@@ -254,7 +279,10 @@ ps2-with-recursion --help
 - **Flatpak Steam** isn't supported (see [Requirements](#requirements)).
 
 Tested on SteamOS 3.9.5 (KDE Plasma 6.7.3, Wayland session) with Proton-CachyOS 11.0,
-Recursion Tracker 0.11.0.11 and xdotool 4.20260303.1.
+Recursion Tracker 0.11.0.11 and xdotool 4.20260303.1. The classic-tray quit was tested with
+Xfce 4.20.8's panel and stalonetray 1.5.0 on a virtual X server (Xvfb, Arch Linux, no window
+manager), with the same Proton and Recursion Tracker. It hasn't been tried on a full Xfce or
+MATE desktop yet; reports are welcome.
 
 ## License
 
