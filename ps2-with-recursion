@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# ps2-with-recursion: run Recursion Tracker alongside PlanetSide 2 on Linux (Steam + Proton),
+# hide its console windows, and quit it cleanly when the game closes.
+#
+# Copyright (C) 2026 ltsJoe
+# SPDX-License-Identifier: GPL-3.0-or-later
+# https://github.com/ltsjoe/ps2-with-recursion
+#
+# Steam launch options for PlanetSide 2:   ~/.local/bin/ps2-with-recursion %command%
+# More:                                    ps2-with-recursion --help
+
+set -u
+
+VERSION=1.0.0
+NAME=ps2-with-recursion
+PS2_APPID=218230
+APPID=${SteamGameId:-${SteamAppId:-$PS2_APPID}}
+WINDOW_CLASS="steam_app_$APPID"            # Proton names every Wine window's X11 class this way
+CONSOLE_RE='\\(rtst_run_dx(64|86)|cmd)\.exe' # console windows to hide (the overlay injector, cmd)
+RT_SUBDIRS=("Program Files (x86)/Recursion/RecursionTracker" "Program Files/Recursion/RecursionTracker")
+
+usage() {
+    cat <<EOF
+$NAME $VERSION: run Recursion Tracker alongside PlanetSide 2 under Steam's Proton.
+
+Usage:
+  $NAME %command%     As PlanetSide 2's Steam launch option (see below).
+  $NAME --test        Start Recursion Tracker on its own and check that it can be
+                      quit cleanly through its tray icon. Close the game first.
+  $NAME --quit-rt     Quit a running Recursion Tracker through its tray menu.
+  $NAME --help | --version
+
+Steam launch options for PlanetSide 2 (Properties > General > Launch Options):
+  ~/.local/bin/$NAME %command%
+
+What it does:
+  - Starts Recursion Tracker in PlanetSide 2's Proton prefix when the game starts.
+  - Hides Recursion Tracker's console windows (the overlay injector).
+  - Quits Recursion Tracker from its tray menu when the game closes, so it saves its
+    settings, or force-closes it 20 s later if that is not possible.
+
+Messages go to the system journal:  journalctl -t $NAME
+EOF
+}
+
+# ---------------------------------------------------------------------------- helpers
+
+VERBOSE=0
+log() {
+    logger -t "$NAME" -- "$*" 2>/dev/null
+    if [ "$VERBOSE" = 1 ] || [ -t 2 ]; then printf '%s: %s\n' "$NAME" "$*" >&2; fi
+    return 0
+}
+die() { log "error: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+x11_ready() { have xdotool && have xwininfo && [ -n "${DISPLAY:-}" ]; }
+
+rt_pid() { pgrep -x -i 'rtst\.exe' | head -n1; }
+
+# Recursion Tracker's folder inside a Proton prefix ($1 = .../pfx).
+find_rt() {
+    local pfx=$1 sub
+    if [ -n "${PS2WR_RT_DIR_LINUX:-}" ] && [ -f "$PS2WR_RT_DIR_LINUX/RTST.exe" ]; then
+        printf '%s\n' "$PS2WR_RT_DIR_LINUX"; return 0
+    fi
+    for sub in "${RT_SUBDIRS[@]}"; do
+        if [ -f "$pfx/drive_c/$sub/RTST.exe" ]; then printf '%s\n' "$pfx/drive_c/$sub"; return 0; fi
+    done
+    return 1
+}
+
+# Folder holding the Windows-side files: next to this script (a git checkout), or installed.
+find_win_dir() {
+    local self d
+    self=$(readlink -f "${BASH_SOURCE[0]}")
+    for d in "${self%/*}/windows" "${XDG_DATA_HOME:-$HOME/.local/share}/$NAME"; do
+        if [ -f "$d/$NAME.bat" ] && [ -f "$d/$NAME.js" ]; then printf '%s\n' "$d"; return 0; fi
+    done
+    return 1
+}
+
+# Every Steam library folder on this machine, one per line.
+steam_libraries() {
+    local root
+    for root in "$HOME/.steam/root" "$HOME/.local/share/Steam" "$HOME/.steam/steam" \
+                "$HOME/.steam/debian-installation"; do
+        [ -f "$root/steamapps/libraryfolders.vdf" ] || continue
+        readlink -f "$root"
+        sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+            "$root/steamapps/libraryfolders.vdf"
+    done | while read -r lib; do if [ -d "$lib" ]; then readlink -f "$lib"; fi; done |
+        awk '!seen[$0]++'
+}
+
+# ------------------------------------------------------------------ D-Bus (tray icons)
+
+if have busctl; then DBUS=busctl; elif have gdbus; then DBUS=gdbus; else DBUS=; fi
+
+sni_items() {
+    case $DBUS in
+    busctl) busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+                org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null |
+                grep -o '"[^"]*"' | tr -d '"' ;;
+    gdbus) gdbus call --session --dest org.kde.StatusNotifierWatcher \
+                --object-path /StatusNotifierWatcher --method org.freedesktop.DBus.Properties.Get \
+                org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems 2>/dev/null |
+                grep -o "'[^']*'" | tr -d "'" ;;
+    esac
+}
+
+sni_window_id() { # $1 service, $2 object path
+    case $DBUS in
+    busctl) busctl --user get-property "$1" "$2" org.kde.StatusNotifierItem WindowId 2>/dev/null |
+                awk '{print $2}' ;;
+    gdbus) gdbus call --session --dest "$1" --object-path "$2" \
+                --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierItem WindowId \
+                2>/dev/null | grep -o '[0-9][0-9]*' | tail -n1 ;;
+    esac
+}
+
+sni_context_menu() { # $1 service, $2 object path, $3 x, $4 y
+    case $DBUS in
+    busctl) busctl --user call "$1" "$2" org.kde.StatusNotifierItem ContextMenu ii "$3" "$4" ;;
+    gdbus) gdbus call --session --dest "$1" --object-path "$2" \
+                --method org.kde.StatusNotifierItem.ContextMenu "$3" "$4" ;;
+    esac >/dev/null 2>&1
+}
+
+# Recursion Tracker's tray icon: a StatusNotifierItem whose X11 window (xembedsniproxy, which
+# KDE Plasma runs to show Wine's tray icons) has this game's window class. Prints "service path".
+rt_tray_item() {
+    local item svc path wid
+    [ -n "$DBUS" ] || return 1
+    for item in $(sni_items); do
+        svc=${item%%/*}
+        case $item in */*) path=/${item#*/} ;; *) path=/StatusNotifierItem ;; esac
+        wid=$(sni_window_id "$svc" "$path")
+        [ -n "$wid" ] && [ "$wid" != 0 ] || continue
+        [ "$(xdotool getwindowclassname "$wid" 2>/dev/null)" = "$WINDOW_CLASS" ] || continue
+        printf '%s %s\n' "$svc" "$path"
+        return 0
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------------ X11 windows
+
+# Recursion Tracker's open tray menu: a mapped override-redirect window with the game's window
+# class, menu-sized (Wine's tray tooltips are about 32 px tall). Prints "x y width height".
+find_menu() {
+    local w geo h wd
+    for w in $(xdotool search --onlyvisible --class "^$WINDOW_CLASS\$" 2>/dev/null); do
+        geo=$(xwininfo -id "$w" 2>/dev/null) || continue
+        grep -q 'Override Redirect State: yes' <<<"$geo" || continue
+        h=$(awk -F: '/^ *Height/{print $2+0}' <<<"$geo")
+        wd=$(awk -F: '/^ *Width/{print $2+0}' <<<"$geo")
+        [ "$h" -ge 60 ] && [ "$h" -le 400 ] && [ "$wd" -le 400 ] || continue
+        awk -F: '/Absolute upper-left X/{x=$2+0} /Absolute upper-left Y/{y=$2+0}
+                 /^ *Width/{w=$2+0} /^ *Height/{h=$2+0} END{print x, y, w, h}' <<<"$geo"
+        return 0
+    done
+    return 1
+}
+
+# Unmap (hide) the console windows Recursion Tracker and the .bat open. Wine leaves them hidden.
+hide_consoles() {
+    local w name
+    for w in $(xdotool search --onlyvisible --class "^$WINDOW_CLASS\$" 2>/dev/null); do
+        name=$(xdotool getwindowname "$w" 2>/dev/null) || continue
+        [[ $name =~ $CONSOLE_RE ]] || continue
+        xdotool windowunmap "$w" 2>/dev/null && log "hid console window: $name"
+    done
+}
+
+# Quit Recursion Tracker through its tray menu's Exit item. Closing its window or sending it
+# WM_CLOSE only hides it to the tray, and only Exit makes it save its settings.
+quit_rt() {
+    # X, Y, SCREEN and WINDOW are set by eval "$(xdotool getmouselocation --shell)".
+    # shellcheck disable=SC2034
+    local pid tray svc path X Y SCREEN WINDOW ox oy menu mx my mh i try
+    pid=$(rt_pid)
+    [ -n "$pid" ] || { log "Recursion Tracker is not running"; return 0; }
+    x11_ready || { log "need xdotool, xwininfo and an X11 display to quit Recursion Tracker"; return 1; }
+    tray=$(rt_tray_item) || {
+        log "no tray icon for Recursion Tracker found (needs a desktop running xembedsniproxy," \
+            "such as KDE Plasma; not available in Steam's Game Mode)"
+        return 1
+    }
+    read -r svc path <<<"$tray"
+
+    eval "$(xdotool getmouselocation --shell)"; ox=$X; oy=$Y
+    # The first right-click after xembedsniproxy moves the icon under the pointer is often lost,
+    # and a right-click while the menu is open closes it, so only retry while no menu is up.
+    menu=$(find_menu)
+    for try in 1 2 3; do
+        [ -n "$menu" ] && break
+        eval "$(xdotool getmouselocation --shell)"
+        sni_context_menu "$svc" "$path" "$X" "$Y"
+        for i in $(seq 1 8); do sleep 0.25; menu=$(find_menu) && break; done
+    done
+    [ -n "$menu" ] || { log "Recursion Tracker's tray menu did not open (tried $try times)"; return 1; }
+
+    # Exit is the menu's last item (Open, Start Session, Save Session, Streaming Overlay,
+    # Options, Update, Exit): click 15 px above its bottom edge, then put the pointer back.
+    read -r mx my _ mh <<<"$menu"
+    log "clicking Exit in Recursion Tracker's tray menu at $((mx + 30)),$((my + mh - 15))"
+    timeout 5 xdotool mousemove --sync $((mx + 30)) $((my + mh - 15)) sleep 0.15 click 1 \
+        sleep 0.15 mousemove "$ox" "$oy"
+    for i in $(seq 1 40); do
+        kill -0 "$pid" 2>/dev/null || { log "Recursion Tracker exited cleanly"; return 0; }
+        sleep 0.25
+    done
+    log "Recursion Tracker is still running 10 s after Exit was clicked"
+    return 1
+}
+
+# ---------------------------------------------------------------------- game session
+
+# Runs in the background for the whole game session. $1 = PID to follow, $2 = quit flag file.
+watch_session() {
+    local follow=$1 flag=$2 x11=1
+    unset LD_PRELOAD
+    x11_ready || { x11=0; log "xdotool, xwininfo or DISPLAY missing: console windows stay visible" \
+                              "and Recursion Tracker will be force-closed"; }
+    while kill -0 "$follow" 2>/dev/null; do
+        [ "$x11" = 1 ] && hide_consoles
+        if [ -e "$flag" ]; then
+            rm -f "$flag"
+            [ "$x11" = 1 ] && quit_rt
+            return
+        fi
+        sleep 1
+    done
+}
+
+run_game() {
+    local game_dir='' a pfx rt_dir win_dir rel f flag
+    for a in "$@"; do case $a in */LaunchPad.exe) game_dir=${a%/*} ;; esac; done
+    if [ -z "$game_dir" ]; then
+        log "LaunchPad.exe is not in Steam's command, running it unchanged"; exec "$@"
+    fi
+    if [ -z "${STEAM_COMPAT_DATA_PATH:-}" ]; then
+        log "STEAM_COMPAT_DATA_PATH is not set (is the game running under Proton?)," \
+            "starting PlanetSide 2 without Recursion Tracker"; exec "$@"
+    fi
+    pfx=$STEAM_COMPAT_DATA_PATH/pfx
+    if ! rt_dir=$(find_rt "$pfx"); then
+        log "Recursion Tracker is not installed in $pfx, starting PlanetSide 2 without it"
+        exec "$@"
+    fi
+    if ! win_dir=$(find_win_dir); then
+        log "can't find $NAME.bat and $NAME.js (reinstall?), starting PlanetSide 2 without" \
+            "Recursion Tracker"; exec "$@"
+    fi
+    for f in "$NAME.bat" "$NAME.js"; do
+        cmp -s "$win_dir/$f" "$game_dir/$f" && continue
+        if ! cp -f "$win_dir/$f" "$game_dir/$f"; then
+            log "can't write $game_dir/$f, starting PlanetSide 2 without Recursion Tracker"
+            exec "$@"
+        fi
+    done
+
+    # Tell the .js where Recursion Tracker is, as a Windows path (C: is the prefix's drive_c).
+    rel=${rt_dir#"$pfx/drive_c/"}
+    export PS2WR_RT_DIR="C:\\${rel//\//\\}"
+
+    flag="$game_dir/$NAME.quit"
+    rm -f "$flag"
+    log "$VERSION: starting PlanetSide 2 with Recursion Tracker ($PS2WR_RT_DIR)"
+    # $$ keeps its PID through the exec below, so the watcher lives exactly as long as the game.
+    watch_session $$ "$flag" </dev/null >/dev/null 2>&1 &
+    exec "${@/LaunchPad.exe/$NAME.bat}"
+}
+
+# ------------------------------------------------------------------------- self-test
+
+self_test() {
+    local lib compat='' pfx rt_dir files wine tray i ok=0
+    VERBOSE=1
+    x11_ready || die "needs xdotool and xwininfo, run inside your desktop session"
+    [ -n "$DBUS" ] || die "needs busctl (systemd) or gdbus (glib2) to reach tray icons"
+    if pgrep -i -x 'launchpad\.exe|planetside2_x64.*|rtst\.exe' >/dev/null; then
+        die "close PlanetSide 2 and Recursion Tracker first"
+    fi
+    while read -r lib; do
+        if [ -d "$lib/steamapps/compatdata/$PS2_APPID/pfx" ]; then
+            compat=$lib/steamapps/compatdata/$PS2_APPID; break
+        fi
+    done < <(steam_libraries)
+    [ -n "$compat" ] || die "no Proton prefix for PlanetSide 2 found; run the game once first"
+    pfx=$compat/pfx
+    rt_dir=$(find_rt "$pfx") || die "Recursion Tracker is not installed in $pfx (see README)"
+    # The prefix's config_info names the Proton build that last ran it (".../files/lib/").
+    files=$(grep -m1 '/files/lib/*$' "$compat/config_info" 2>/dev/null)
+    files=${files%/}; files=${files%/lib}
+    wine=$files/bin/wine
+    [ -x "$wine" ] || die "can't find the Proton build this prefix uses (looked for $wine)"
+
+    log "prefix:  $pfx"
+    log "tracker: $rt_dir"
+    log "wine:    $wine"
+    log "starting Recursion Tracker; your pointer will jump to its tray menu once at the end"
+    (cd "$rt_dir" && WINEPREFIX=$pfx SteamGameId=$PS2_APPID SteamAppId=$PS2_APPID WINEDEBUG=-all \
+        WINEDLLOVERRIDES="winemenubuilder.exe=d" setsid "$wine" RTST.exe </dev/null >/dev/null 2>&1 &)
+
+    tray=
+    for i in $(seq 1 120); do
+        sleep 1
+        hide_consoles
+        tray=$(rt_tray_item) && break
+    done
+    if [ -z "$tray" ]; then
+        log "FAIL: Recursion Tracker's tray icon never showed up. Clean quitting needs a desktop" \
+            "that shows Wine tray icons through xembedsniproxy (KDE Plasma does)."
+    else
+        log "tray icon found after ${i}s; letting Recursion Tracker settle for 10 s"
+        for i in $(seq 1 10); do sleep 1; hide_consoles; done
+        quit_rt && ok=1
+    fi
+    if [ "$ok" = 1 ]; then
+        log "PASS: Recursion Tracker can be quit cleanly on this desktop"
+        return 0
+    fi
+    log "FAIL: in-game, Recursion Tracker would be force-closed instead. Cleaning up."
+    WINEPREFIX=$pfx "$files/bin/wineserver" -k 2>/dev/null
+    return 1
+}
+
+# ------------------------------------------------------------------------------ main
+
+# install.sh sources this file for the helpers above; only run when executed.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
+case ${1:-} in
+    -h|--help) usage ;;
+    --version) echo "$NAME $VERSION" ;;
+    --quit-rt) VERBOSE=1; quit_rt ;;
+    --test)    self_test ;;
+    '')        usage; exit 1 ;;
+    -*)        echo "$NAME: unknown option $1 (try --help)" >&2; exit 1 ;;
+    *)         run_game "$@" ;;
+esac
