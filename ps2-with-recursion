@@ -11,13 +11,15 @@
 
 set -u
 
-VERSION=1.0.0
+VERSION=1.1.0
 NAME=ps2-with-recursion
 PS2_APPID=218230
 APPID=${SteamGameId:-${SteamAppId:-$PS2_APPID}}
 WINDOW_CLASS="steam_app_$APPID"            # Proton names every Wine window's X11 class this way
 CONSOLE_RE='\\(rtst_run_dx(64|86)|cmd)\.exe' # console windows to hide (the overlay injector, cmd)
 RT_SUBDIRS=("Program Files (x86)/Recursion/RecursionTracker" "Program Files/Recursion/RecursionTracker")
+NO_TRAY_HINT="Clean quitting needs a system tray that shows Wine's icons: KDE Plasma, or a classic \
+tray such as Xfce's or MATE's (with xprop installed). GNOME and Steam's Game Mode have none."
 
 usage() {
     cat <<EOF
@@ -173,33 +175,120 @@ hide_consoles() {
     done
 }
 
+# ------------------------------------------------------------- classic (XEmbed) trays
+
+# Is KDE's xembedsniproxy serving this X display? Then Wine's tray icons are shown through the
+# StatusNotifierItem tray, and the X windows it embeds them in must never be clicked directly.
+xembedsniproxy_active() {
+    local pid
+    for pid in $(pgrep -u "$(id -u)" -x xembedsniproxy); do
+        [ -r "/proc/$pid/environ" ] || return 0     # can't tell: assume it serves this display
+        tr '\0' '\n' <"/proc/$pid/environ" | grep -qx "DISPLAY=${DISPLAY:-}" && return 0
+    done
+    return 1
+}
+
+xembed_tray_usable() { have xprop && ! xembedsniproxy_active; }
+
+# Window $1 (decimal id) and its ancestors below the root window, one decimal id per line.
+window_and_ancestors() {
+    local w=$1 parent root i
+    root=$(xwininfo -root | awk '/Window id:/{print $4}')
+    for i in $(seq 1 12); do
+        printf '%d\n' "$w"
+        parent=$(xwininfo -tree -id "$w" 2>/dev/null | awk '/Parent window id:/{print $4}')
+        [ -n "$parent" ] && [ "$((parent))" != "$((root))" ] || return 0
+        w=$parent
+    done
+}
+
+# Recursion Tracker's icon in a classic XEmbed system tray (Xfce, MATE, Budgie, LXDE, LXQt,
+# stalonetray, ...): a small mapped window with the game's window class, carrying the
+# _XEMBED_INFO property Wine sets when a tray docks it, and fully on screen.
+# Prints "window x y width height".
+xembed_tray_icon() {
+    local w geo x y wd h sw sh
+    read -r sw sh < <(xdotool getdisplaygeometry)
+    for w in $(xdotool search --onlyvisible --class "^$WINDOW_CLASS\$" 2>/dev/null); do
+        geo=$(xwininfo -id "$w" 2>/dev/null) || continue
+        grep -q 'Override Redirect State: no' <<<"$geo" || continue
+        read -r x y wd h < <(awk -F: '/Absolute upper-left X/{x=$2+0} /Absolute upper-left Y/{y=$2+0}
+                 /^ *Width/{w=$2+0} /^ *Height/{h=$2+0} END{print x, y, w, h}' <<<"$geo")
+        [ "$wd" -ge 8 ] && [ "$wd" -le 96 ] && [ "$h" -ge 8 ] && [ "$h" -le 96 ] || continue
+        [ "$x" -ge 0 ] && [ "$y" -ge 0 ] && [ $((x + wd)) -le "$sw" ] && [ $((y + h)) -le "$sh" ] ||
+            continue
+        xprop -id "$w" _XEMBED_INFO 2>/dev/null | grep -q '=' || continue
+        printf '%s %s %s %s %s\n' "$w" "$x" "$y" "$wd" "$h"
+        return 0
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------------ tray menu
+
+# Right-click the StatusNotifierItem ($1 service, $2 path) until Recursion Tracker's menu opens.
+# The first right-click after xembedsniproxy moves the icon under the pointer is often lost, and
+# a right-click while the menu is open closes it, so only retry while no menu is up.
+open_menu_sni() {
+    # shellcheck disable=SC2034 # set by eval "$(xdotool getmouselocation --shell)"
+    local X Y SCREEN WINDOW i
+    for _ in 1 2 3; do
+        find_menu >/dev/null && return 0
+        eval "$(xdotool getmouselocation --shell)"
+        sni_context_menu "$1" "$2" "$X" "$Y"
+        for i in $(seq 1 8); do sleep 0.25; find_menu >/dev/null && return 0; done
+    done
+    return 1
+}
+
+# Right-click the icon in a classic tray until Recursion Tracker's menu opens. Before clicking,
+# make sure the pointer really is over the icon: desktops that draw tray icons themselves
+# (GNOME's extensions, for one) leave Wine's window somewhere the pointer can't reach.
+open_menu_xembed() {
+    # shellcheck disable=SC2034 # set by eval "$(xdotool ... getmouselocation --shell)"
+    local X Y SCREEN WINDOW i icon w x y wd h
+    for _ in 1 2 3; do
+        find_menu >/dev/null && return 0
+        icon=$(xembed_tray_icon) || return 1
+        read -r w x y wd h <<<"$icon"
+        eval "$(xdotool mousemove --sync $((x + wd / 2)) $((y + h / 2)) getmouselocation --shell)"
+        if ! window_and_ancestors "$w" | grep -qx "$WINDOW"; then
+            log "the pointer at Recursion Tracker's tray icon ($((x + wd / 2)),$((y + h / 2)))" \
+                "is over another window, so not clicking"
+            return 1
+        fi
+        xdotool click 3
+        for i in $(seq 1 8); do sleep 0.25; find_menu >/dev/null && return 0; done
+    done
+    return 1
+}
+
 # Quit Recursion Tracker through its tray menu's Exit item. Closing its window or sending it
 # WM_CLOSE only hides it to the tray, and only Exit makes it save its settings.
 quit_rt() {
-    # X, Y, SCREEN and WINDOW are set by eval "$(xdotool getmouselocation --shell)".
-    # shellcheck disable=SC2034
-    local pid tray svc path X Y SCREEN WINDOW ox oy menu mx my mh i try
+    # shellcheck disable=SC2034 # set by eval "$(xdotool getmouselocation --shell)"
+    local pid tray svc path X Y SCREEN WINDOW ox oy menu mx my mh i opened=1
     pid=$(rt_pid)
     [ -n "$pid" ] || { log "Recursion Tracker is not running"; return 0; }
     x11_ready || { log "need xdotool, xwininfo and an X11 display to quit Recursion Tracker"; return 1; }
-    tray=$(rt_tray_item) || {
-        log "no tray icon for Recursion Tracker found (needs a desktop running xembedsniproxy," \
-            "such as KDE Plasma; not available in Steam's Game Mode)"
-        return 1
-    }
-    read -r svc path <<<"$tray"
 
     eval "$(xdotool getmouselocation --shell)"; ox=$X; oy=$Y
-    # The first right-click after xembedsniproxy moves the icon under the pointer is often lost,
-    # and a right-click while the menu is open closes it, so only retry while no menu is up.
-    menu=$(find_menu)
-    for try in 1 2 3; do
-        [ -n "$menu" ] && break
-        eval "$(xdotool getmouselocation --shell)"
-        sni_context_menu "$svc" "$path" "$X" "$Y"
-        for i in $(seq 1 8); do sleep 0.25; menu=$(find_menu) && break; done
-    done
-    [ -n "$menu" ] || { log "Recursion Tracker's tray menu did not open (tried $try times)"; return 1; }
+    if tray=$(rt_tray_item); then
+        read -r svc path <<<"$tray"
+        log "found Recursion Tracker's tray icon (StatusNotifierItem $svc)"
+        open_menu_sni "$svc" "$path" || opened=0
+    elif xembed_tray_usable && xembed_tray_icon >/dev/null; then
+        log "found Recursion Tracker's tray icon in a classic (XEmbed) system tray"
+        open_menu_xembed || opened=0
+    else
+        log "no tray icon for Recursion Tracker found. $NO_TRAY_HINT"
+        return 1
+    fi
+    if [ "$opened" = 0 ] || ! menu=$(find_menu); then
+        xdotool mousemove "$ox" "$oy"
+        log "Recursion Tracker's tray menu did not open"
+        return 1
+    fi
 
     # Exit is the menu's last item (Open, Start Session, Save Session, Streaming Overlay,
     # Options, Update, Exit): click 15 px above its bottom edge, then put the pointer back.
@@ -279,7 +368,6 @@ self_test() {
     local lib compat='' pfx rt_dir files wine tray i ok=0
     VERBOSE=1
     x11_ready || die "needs xdotool and xwininfo, run inside your desktop session"
-    [ -n "$DBUS" ] || die "needs busctl (systemd) or gdbus (glib2) to reach tray icons"
     if pgrep -i -x 'launchpad\.exe|planetside2_x64.*|rtst\.exe' >/dev/null; then
         die "close PlanetSide 2 and Recursion Tracker first"
     fi
@@ -308,11 +396,11 @@ self_test() {
     for i in $(seq 1 120); do
         sleep 1
         hide_consoles
-        tray=$(rt_tray_item) && break
+        if rt_tray_item >/dev/null; then tray=sni; break; fi
+        if xembed_tray_usable && xembed_tray_icon >/dev/null; then tray=xembed; break; fi
     done
     if [ -z "$tray" ]; then
-        log "FAIL: Recursion Tracker's tray icon never showed up. Clean quitting needs a desktop" \
-            "that shows Wine tray icons through xembedsniproxy (KDE Plasma does)."
+        log "FAIL: Recursion Tracker's tray icon never showed up. $NO_TRAY_HINT"
     else
         log "tray icon found after ${i}s; letting Recursion Tracker settle for 10 s"
         for i in $(seq 1 10); do sleep 1; hide_consoles; done

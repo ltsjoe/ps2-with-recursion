@@ -123,15 +123,15 @@ package_hint() {
         like=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"')
     fi
     if [ -e /run/ostree-booted ]; then
-        echo "rpm-ostree install xdotool xwininfo   (then reboot)"; return
+        echo "rpm-ostree install xdotool xwininfo xprop   (then reboot)"; return
     fi
     case " $id $like " in
         *" steamos "*) echo "SteamOS ships them; if they are missing, update SteamOS" ;;
-        *" arch "*)    echo "sudo pacman -S --needed xdotool xorg-xwininfo" ;;
+        *" arch "*)    echo "sudo pacman -S --needed xdotool xorg-xwininfo xorg-xprop" ;;
         *" debian "*|*" ubuntu "*) echo "sudo apt install xdotool x11-utils" ;;
-        *" fedora "*|*" rhel "*)   echo "sudo dnf install xdotool xwininfo" ;;
-        *" suse "*|*" opensuse "*) echo "sudo zypper install xdotool xwininfo" ;;
-        *) echo "install xdotool and xwininfo (often in an x11-utils package)" ;;
+        *" fedora "*|*" rhel "*)   echo "sudo dnf install xdotool xwininfo xprop" ;;
+        *" suse "*|*" opensuse "*) echo "sudo zypper install xdotool xwininfo xprop" ;;
+        *) echo "install xdotool, xwininfo and xprop (often in an x11-utils package)" ;;
     esac
 }
 
@@ -144,8 +144,12 @@ check_dependencies() {
         warn "To install them: $(package_hint)"
     fi
     if ! have busctl && ! have gdbus; then
-        warn "neither busctl (systemd) nor gdbus (glib2) found: Recursion Tracker can't be quit"
-        warn "through its tray icon and will be force-closed instead."
+        warn "neither busctl (systemd) nor gdbus (glib2) found: on KDE Plasma, Recursion Tracker"
+        warn "can't be quit through its tray icon and will be force-closed instead."
+    fi
+    if ! have xprop && [[ ${XDG_CURRENT_DESKTOP:-} != *KDE* ]]; then
+        warn "xprop not found: Recursion Tracker can't be quit through a classic system tray"
+        warn "(Xfce, MATE, ...) and will be force-closed instead. To install it: $(package_hint)"
     fi
 }
 
