@@ -138,7 +138,7 @@ rt_tray_item() {
         svc=${item%%/*}
         case $item in */*) path=/${item#*/} ;; *) path=/StatusNotifierItem ;; esac
         wid=$(sni_window_id "$svc" "$path")
-        [ -n "$wid" ] && [ "$wid" != 0 ] || continue
+        [[ -n $wid && $wid != 0 ]] || continue
         [ "$(xdotool getwindowclassname "$wid" 2>/dev/null)" = "$WINDOW_CLASS" ] || continue
         printf '%s %s\n' "$svc" "$path"
         return 0
@@ -157,7 +157,7 @@ find_menu() {
         grep -q 'Override Redirect State: yes' <<<"$geo" || continue
         h=$(awk -F: '/^ *Height/{print $2+0}' <<<"$geo")
         wd=$(awk -F: '/^ *Width/{print $2+0}' <<<"$geo")
-        [ "$h" -ge 60 ] && [ "$h" -le 400 ] && [ "$wd" -le 400 ] || continue
+        (( h >= 60 && h <= 400 && wd <= 400 )) || continue
         awk -F: '/Absolute upper-left X/{x=$2+0} /Absolute upper-left Y/{y=$2+0}
                  /^ *Width/{w=$2+0} /^ *Height/{h=$2+0} END{print x, y, w, h}' <<<"$geo"
         return 0
@@ -214,9 +214,8 @@ xembed_tray_icon() {
         grep -q 'Override Redirect State: no' <<<"$geo" || continue
         read -r x y wd h < <(awk -F: '/Absolute upper-left X/{x=$2+0} /Absolute upper-left Y/{y=$2+0}
                  /^ *Width/{w=$2+0} /^ *Height/{h=$2+0} END{print x, y, w, h}' <<<"$geo")
-        [ "$wd" -ge 8 ] && [ "$wd" -le 96 ] && [ "$h" -ge 8 ] && [ "$h" -le 96 ] || continue
-        [ "$x" -ge 0 ] && [ "$y" -ge 0 ] && [ $((x + wd)) -le "$sw" ] && [ $((y + h)) -le "$sh" ] ||
-            continue
+        (( wd >= 8 && wd <= 96 && h >= 8 && h <= 96 )) || continue
+        (( x >= 0 && y >= 0 && x + wd <= sw && y + h <= sh )) || continue
         xprop -id "$w" _XEMBED_INFO 2>/dev/null | grep -q '=' || continue
         printf '%s %s %s %s %s\n' "$w" "$x" "$y" "$wd" "$h"
         return 0
