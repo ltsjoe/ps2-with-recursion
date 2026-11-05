@@ -1,0 +1,31 @@
+# Checks the scripts on every pull request and every push to main. A failure shows on the PR.
+name: Lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tool versions
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+          shellcheck --version
+          node --version
+
+      - name: shellcheck (Linux side)
+        run: shellcheck -x ps2-with-recursion install.sh
+
+      - name: JavaScript syntax (Windows side)
+        run: node --check windows/ps2-with-recursion.js
